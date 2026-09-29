@@ -1,0 +1,94 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Lets release.yml run this suite and gate publishing on it.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend (vitest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: react/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: react
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check and run tests
+        working-directory: react
+        run: pnpm test
+
+  python:
+    name: Python ${{ matrix.python-version }} (pytest)
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+
+    env:
+      # Some service tests currently depend on the machine's local timezone
+      # and only pass in CET/CEST. Remove once they pin the timezone.
+      TZ: Europe/Berlin
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The packaging and resource tests need the built frontend in
+      # graupel/react.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: react/pnpm-lock.yaml
+
+      - name: Build React frontend
+        working-directory: react
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install project and dev dependencies
+        run: uv sync
+
+      - name: Run tests
+        run: uv run pytest
