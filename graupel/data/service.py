@@ -1,5 +1,6 @@
+import logging
 from datetime import datetime, timezone, timedelta, tzinfo
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 from .models import (
     MeteogramConfig,
@@ -56,6 +57,12 @@ DEFAULT_PRESSURE_LEVELS = [
     150,
     100,
 ]
+
+# Cached vertical cloud profiles older than this are refetched. The regional
+# models used for cloud chains publish new runs every 1-3 hours.
+CLOUD_CACHE_MAX_AGE = timedelta(hours=1)
+
+logger = logging.getLogger(__name__)
 
 
 def estimate_altitude_m_asl(pressure_hpa: float) -> float:
@@ -174,10 +181,42 @@ def get_past_hours_for_yesterday(
 
 class ForecastService:
     def __init__(
-        self, client: OpenMeteoClient = None, storage: Storage = None
+        self,
+        client: OpenMeteoClient = None,
+        storage: Storage = None,
+        cloud_cache_max_age: timedelta = CLOUD_CACHE_MAX_AGE,
     ):
         self.client = client or OpenMeteoClient()
         self.storage = storage or Storage()
+        self.cloud_cache_max_age = cloud_cache_max_age
+
+    def _is_cloud_cache_fresh(self, fetched_at: Optional[datetime]) -> bool:
+        if fetched_at is None:
+            return False
+        age = datetime.now(timezone.utc) - fetched_at
+        # A fetch time in the future (e.g. after a clock change) is stale.
+        return timedelta(0) <= age < self.cloud_cache_max_age
+
+    @staticmethod
+    def _normalize_cached_cloud_forecast(
+        cached: DetailedCloudForecast, model: WeatherModel
+    ) -> DetailedCloudForecast:
+        cached.profiles = sorted(
+            [
+                profile.model_copy(
+                    update={
+                        "timestamp": canonical_timestamp(profile.timestamp)
+                    }
+                )
+                for profile in cached.profiles
+            ],
+            key=lambda profile: parse_timestamp(profile.timestamp),
+        )
+        validate_timestamp_sequence(
+            [profile.timestamp for profile in cached.profiles],
+            dataset_name=f"{model.name} cached vertical cloud timeline",
+        )
+        return cached
 
     def _extract_sun_periods(
         self, raw_response: Dict[str, Any]
@@ -886,29 +925,20 @@ class ForecastService:
         self, location: Location, model: WeatherModel
     ) -> DetailedCloudForecast:
         """
-        Fetches or retrieves cached vertical cloud pressure-level forecast for a single model across its full horizon.
+        Fetches the vertical cloud pressure-level forecast for a single model
+        across its full horizon.
+
+        A cached copy is reused while it is younger than
+        ``cloud_cache_max_age``. Older copies are refetched; if that fetch
+        fails or returns nothing, the stale copy is returned instead.
         """
         model_id = model.id or to_open_meteo_model(model.name)
-        cached = self.storage.read_vertical_cloud_forecast(location, model_id)
-        if cached:
-            cached.profiles = sorted(
-                [
-                    profile.model_copy(
-                        update={
-                            "timestamp": canonical_timestamp(
-                                profile.timestamp
-                            )
-                        }
-                    )
-                    for profile in cached.profiles
-                ],
-                key=lambda profile: parse_timestamp(profile.timestamp),
-            )
-            validate_timestamp_sequence(
-                [profile.timestamp for profile in cached.profiles],
-                dataset_name=f"{model.name} cached vertical cloud timeline",
-            )
-            return cached
+        entry = self.storage.read_vertical_cloud_forecast_entry(
+            location, model_id
+        )
+        cached, fetched_at = entry if entry else (None, None)
+        if cached is not None and self._is_cloud_cache_fresh(fetched_at):
+            return self._normalize_cached_cloud_forecast(cached, model)
 
         levels_to_fetch = model.pressure_levels_hpa or DEFAULT_PRESSURE_LEVELS
         horizon = (
@@ -934,8 +964,12 @@ class ForecastService:
 
         try:
             raw_response = await self.client._get(params)
-        except Exception:
-            # Fallback mock empty if fetch fails
+        except Exception as error:
+            logger.warning(
+                "Failed to fetch vertical cloud profile for %s: %s",
+                model.name,
+                error,
+            )
             raw_response = {}
 
         hourly = raw_response.get("hourly", {})
@@ -998,6 +1032,16 @@ class ForecastService:
             self.storage.save_vertical_cloud_forecast(
                 location, model_id, forecast_result
             )
+            return forecast_result
+
+        if cached is not None:
+            logger.warning(
+                "Using stale cached vertical cloud profile for %s "
+                "(fetched %s)",
+                model.name,
+                fetched_at.isoformat() if fetched_at else "at unknown time",
+            )
+            return self._normalize_cached_cloud_forecast(cached, model)
 
         return forecast_result
 

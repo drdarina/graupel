@@ -292,3 +292,257 @@ async def test_get_vertical_cloud_forecast_source_transitions():
     assert len(transitions) == 1
     assert transitions[0].from_model == "meteoswiss_icon_ch1"
     assert transitions[0].to_model == "gfs_seamless"
+
+
+# ---------------------------------------------------------------------------
+# Vertical cloud cache expiry
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta  # noqa: E402
+import sqlite3  # noqa: E402
+
+from graupel.data.service import CLOUD_CACHE_MAX_AGE  # noqa: E402
+
+CACHE_LOC = Location(name="Zugspitze", latitude=47.4211, longitude=10.9853)
+CACHE_MODEL = WeatherModel(
+    name="ICON-D2",
+    id="icon_d2",
+    max_forecast_horizon_hours=2,
+    pressure_levels_hpa=[850],
+)
+
+
+def _cloud_forecast(cover: float) -> DetailedCloudForecast:
+    return DetailedCloudForecast(
+        location=CACHE_LOC,
+        profiles=[
+            VerticalCloudProfile(
+                timestamp="2026-09-11T00:00:00Z",
+                source_model_id="icon_d2",
+                source_model_name="ICON-D2",
+                levels=[
+                    VerticalCloudLevel(
+                        pressure_hpa=850,
+                        altitude_m_asl=1450,
+                        cloud_cover_percent=cover,
+                    )
+                ],
+            )
+        ],
+    )
+
+
+class _CloudClient:
+    """Fake Open-Meteo client returning one hour of 850 hPa cloud cover."""
+
+    def __init__(self, cover: float = 90.0, fail: bool = False):
+        self.cover = cover
+        self.fail = fail
+        self.calls = 0
+
+    async def _get(self, params):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("network down")
+        return {
+            "timezone": "GMT",
+            "hourly": {
+                "time": ["2026-09-11T00:00"],
+                "cloud_cover_850hPa": [self.cover],
+                "geopotential_height_850hPa": [1500.0],
+            },
+        }
+
+
+def _cover(forecast: DetailedCloudForecast) -> float:
+    return forecast.profiles[0].levels[0].cloud_cover_percent
+
+
+def test_default_cloud_cache_max_age_is_one_hour():
+    assert CLOUD_CACHE_MAX_AGE == timedelta(hours=1)
+
+
+def test_cloud_cache_entry_records_fetch_time():
+    storage = Storage(":memory:")
+    fetched = datetime(2026, 9, 11, 6, 0, tzinfo=timezone.utc)
+    storage.save_vertical_cloud_forecast(
+        CACHE_LOC, "icon_d2", _cloud_forecast(10), fetched_at=fetched
+    )
+
+    forecast, fetched_at = storage.read_vertical_cloud_forecast_entry(
+        CACHE_LOC, "icon_d2"
+    )
+    assert _cover(forecast) == 10
+    assert fetched_at == fetched
+
+
+@pytest.mark.asyncio
+async def test_fresh_cloud_cache_is_reused_without_fetching():
+    storage = Storage(":memory:")
+    storage.save_vertical_cloud_forecast(
+        CACHE_LOC, "icon_d2", _cloud_forecast(10)
+    )
+    client = _CloudClient(cover=90)
+    service = ForecastService(client=client, storage=storage)
+
+    result = await service.fetch_vertical_cloud_model_forecast(
+        CACHE_LOC, CACHE_MODEL
+    )
+
+    assert client.calls == 0
+    assert _cover(result) == 10
+
+
+@pytest.mark.asyncio
+async def test_stale_cloud_cache_is_refetched_and_replaced():
+    storage = Storage(":memory:")
+    stale_time = datetime.now(timezone.utc) - CLOUD_CACHE_MAX_AGE - timedelta(
+        minutes=1
+    )
+    storage.save_vertical_cloud_forecast(
+        CACHE_LOC, "icon_d2", _cloud_forecast(10), fetched_at=stale_time
+    )
+    client = _CloudClient(cover=90)
+    service = ForecastService(client=client, storage=storage)
+
+    result = await service.fetch_vertical_cloud_model_forecast(
+        CACHE_LOC, CACHE_MODEL
+    )
+
+    assert client.calls == 1
+    assert _cover(result) == 90
+    forecast, fetched_at = storage.read_vertical_cloud_forecast_entry(
+        CACHE_LOC, "icon_d2"
+    )
+    assert _cover(forecast) == 90
+    assert fetched_at > stale_time
+
+    # The refreshed entry is fresh again, so a second view does not refetch.
+    await service.fetch_vertical_cloud_model_forecast(CACHE_LOC, CACHE_MODEL)
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cloud_cache_respects_custom_max_age():
+    storage = Storage(":memory:")
+    storage.save_vertical_cloud_forecast(
+        CACHE_LOC,
+        "icon_d2",
+        _cloud_forecast(10),
+        fetched_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+    )
+    client = _CloudClient(cover=90)
+    service = ForecastService(
+        client=client,
+        storage=storage,
+        cloud_cache_max_age=timedelta(minutes=5),
+    )
+
+    result = await service.fetch_vertical_cloud_model_forecast(
+        CACHE_LOC, CACHE_MODEL
+    )
+
+    assert client.calls == 1
+    assert _cover(result) == 90
+
+
+@pytest.mark.asyncio
+async def test_cloud_cache_with_future_fetch_time_is_refetched():
+    storage = Storage(":memory:")
+    storage.save_vertical_cloud_forecast(
+        CACHE_LOC,
+        "icon_d2",
+        _cloud_forecast(10),
+        fetched_at=datetime.now(timezone.utc) + timedelta(hours=2),
+    )
+    client = _CloudClient(cover=90)
+    service = ForecastService(client=client, storage=storage)
+
+    result = await service.fetch_vertical_cloud_model_forecast(
+        CACHE_LOC, CACHE_MODEL
+    )
+
+    assert client.calls == 1
+    assert _cover(result) == 90
+
+
+@pytest.mark.asyncio
+async def test_stale_cloud_cache_is_kept_when_refetch_fails():
+    storage = Storage(":memory:")
+    storage.save_vertical_cloud_forecast(
+        CACHE_LOC,
+        "icon_d2",
+        _cloud_forecast(10),
+        fetched_at=datetime.now(timezone.utc) - timedelta(hours=5),
+    )
+    client = _CloudClient(fail=True)
+    service = ForecastService(client=client, storage=storage)
+
+    result = await service.fetch_vertical_cloud_model_forecast(
+        CACHE_LOC, CACHE_MODEL
+    )
+
+    assert client.calls == 1
+    assert _cover(result) == 10
+
+
+@pytest.mark.asyncio
+async def test_failed_fetch_without_cache_returns_empty_forecast():
+    storage = Storage(":memory:")
+    client = _CloudClient(fail=True)
+    service = ForecastService(client=client, storage=storage)
+
+    result = await service.fetch_vertical_cloud_model_forecast(
+        CACHE_LOC, CACHE_MODEL
+    )
+
+    assert client.calls == 1
+    assert result.profiles == []
+    assert storage.read_vertical_cloud_forecast(CACHE_LOC, "icon_d2") is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_database_rows_are_migrated_and_refetched(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    loc_key = f"{CACHE_LOC.latitude:.4f}_{CACHE_LOC.longitude:.4f}"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE vertical_cloud_forecasts (
+                id TEXT PRIMARY KEY,
+                location_key TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                data TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO vertical_cloud_forecasts VALUES (?, ?, ?, ?)",
+            (
+                f"{loc_key}_icon_d2",
+                loc_key,
+                "icon_d2",
+                _cloud_forecast(10).model_dump_json(),
+            ),
+        )
+    conn.close()
+
+    storage = Storage(str(db_path))
+    forecast, fetched_at = storage.read_vertical_cloud_forecast_entry(
+        CACHE_LOC, "icon_d2"
+    )
+    assert _cover(forecast) == 10
+    assert fetched_at is None
+
+    client = _CloudClient(cover=90)
+    service = ForecastService(client=client, storage=storage)
+    result = await service.fetch_vertical_cloud_model_forecast(
+        CACHE_LOC, CACHE_MODEL
+    )
+
+    assert client.calls == 1
+    assert _cover(result) == 90
+    _, fetched_at = storage.read_vertical_cloud_forecast_entry(
+        CACHE_LOC, "icon_d2"
+    )
+    assert fetched_at is not None
