@@ -1,6 +1,7 @@
 import sqlite3
 import json
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
 from .models import MeteogramConfig, Location, DetailedCloudForecast
 
 
@@ -52,9 +53,23 @@ class Storage:
                         id TEXT PRIMARY KEY,
                         location_key TEXT NOT NULL,
                         model_id TEXT NOT NULL,
-                        data TEXT NOT NULL
+                        data TEXT NOT NULL,
+                        fetched_at TEXT
                     )
                     """)
+                # Older databases predate fetched_at. Their rows keep NULL and
+                # are treated as stale, so they are refetched on next use.
+                cloud_columns = [
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(vertical_cloud_forecasts)"
+                    ).fetchall()
+                ]
+                if "fetched_at" not in cloud_columns:
+                    conn.execute(
+                        "ALTER TABLE vertical_cloud_forecasts "
+                        "ADD COLUMN fetched_at TEXT"
+                    )
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS location_history (
                         id TEXT PRIMARY KEY,
@@ -199,39 +214,66 @@ class Storage:
         location: Location,
         model_id: str,
         detailed_forecast: DetailedCloudForecast,
+        fetched_at: Optional[datetime] = None,
     ) -> None:
         loc_key = f"{location.latitude:.4f}_{location.longitude:.4f}"
         rec_id = f"{loc_key}_{model_id.lower()}"
+        if fetched_at is None:
+            fetched_at = datetime.now(timezone.utc)
         with self._db_connection() as conn:
             with conn:
                 conn.execute(
                     """
-                    INSERT INTO vertical_cloud_forecasts (id, location_key, model_id, data)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET data = excluded.data
+                    INSERT INTO vertical_cloud_forecasts
+                        (id, location_key, model_id, data, fetched_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        data = excluded.data,
+                        fetched_at = excluded.fetched_at
                     """,
                     (
                         rec_id,
                         loc_key,
                         model_id.lower(),
                         detailed_forecast.model_dump_json(),
+                        fetched_at.astimezone(timezone.utc).isoformat(),
                     ),
                 )
 
-    def read_vertical_cloud_forecast(
+    def read_vertical_cloud_forecast_entry(
         self, location: Location, model_id: str
-    ) -> Optional[DetailedCloudForecast]:
+    ) -> Optional[Tuple[DetailedCloudForecast, Optional[datetime]]]:
+        """Return the cached forecast and when it was fetched (UTC).
+
+        The fetch time is None for rows written before it was recorded.
+        """
         loc_key = f"{location.latitude:.4f}_{location.longitude:.4f}"
         rec_id = f"{loc_key}_{model_id.lower()}"
         with self._db_connection() as conn:
             cursor = conn.execute(
-                "SELECT data FROM vertical_cloud_forecasts WHERE id = ?",
+                "SELECT data, fetched_at FROM vertical_cloud_forecasts "
+                "WHERE id = ?",
                 (rec_id,),
             )
             row = cursor.fetchone()
-            if row:
-                return DetailedCloudForecast.model_validate_json(row[0])
-            return None
+            if not row:
+                return None
+            forecast = DetailedCloudForecast.model_validate_json(row[0])
+            fetched_at = None
+            if row[1]:
+                try:
+                    fetched_at = datetime.fromisoformat(row[1])
+                except ValueError:
+                    fetched_at = None
+                if fetched_at is not None and fetched_at.tzinfo is None:
+                    fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+            return forecast, fetched_at
+
+    def read_vertical_cloud_forecast(
+        self, location: Location, model_id: str
+    ) -> Optional[DetailedCloudForecast]:
+        entry = self.read_vertical_cloud_forecast_entry(location, model_id)
+        return entry[0] if entry else None
 
     def record_location_selection(self, location: Location) -> None:
         import datetime
