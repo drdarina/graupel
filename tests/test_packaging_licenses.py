@@ -1,7 +1,10 @@
+import shutil
+import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
-import subprocess
+
+import pytest
 
 
 LICENSE_EXPRESSION = "GPL-3.0-or-later AND MPL-2.0"
@@ -51,9 +54,30 @@ def test_license_files_exist_in_root():
 
 def test_license_files_included_in_sdist_and_wheel(tmp_path):
     root = Path(__file__).resolve().parent.parent
-    dist_dir = tmp_path / "dist"
+    if not (root / "graupel" / "react" / "index.html").is_file():
+        pytest.skip("frontend not built; run `make react` first")
 
-    import shutil
+    # Build from a copy so a failed build can never leave staging
+    # directories (e.g. graupel-<version>/) in the working tree.
+    src = tmp_path / "src"
+    shutil.copytree(
+        root,
+        src,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            "venv",
+            "node_modules",
+            "dist",
+            "build",
+            "*.egg-info",
+            "__pycache__",
+            ".pytest_cache",
+            "log",
+            "*.db",
+        ),
+    )
+    dist_dir = tmp_path / "dist"
 
     uv_bin = shutil.which("uv") or "uv"
     cmd = [
@@ -62,7 +86,7 @@ def test_license_files_included_in_sdist_and_wheel(tmp_path):
         "--out-dir",
         str(dist_dir),
     ]
-    res = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+    res = subprocess.run(cmd, cwd=src, capture_output=True, text=True)
     assert res.returncode == 0, f"uv build failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
 
     sdists = list(dist_dir.glob("*.tar.gz"))
